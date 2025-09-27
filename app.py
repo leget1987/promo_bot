@@ -4,6 +4,7 @@ import os
 import random
 import string
 import sqlite3
+import qrcode
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
