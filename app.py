@@ -3,7 +3,8 @@ import logging
 import os
 import random
 import string
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import qrcode
 from datetime import datetime
 from dotenv import load_dotenv
@@ -16,8 +17,15 @@ load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 CHANNEL_USERNAME = os.getenv('CHANNEL_USERNAME')
 ADMIN_USER_NAMES = ast.literal_eval(os.getenv('ADMIN_USER_NAMES'))
-DATABASE_NAME = os.getenv('DATABASE_NAME')
 
+# PostgreSQL настройки
+DB_CONFIG = {
+    'dbname': os.getenv('DB_NAME', 'promo_bot_db'),
+    'user': os.getenv('DB_USER', 'promo_bot_user'),
+    'password': os.getenv('DB_PASSWORD', 'your_secure_password'),
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'port': os.getenv('DB_PORT', '5432')
+}
 
 # Настройки генерации кодов
 CODE_LENGTH = 8
@@ -31,24 +39,30 @@ logging.basicConfig(
 
 
 # ===== DATABASE FUNCTIONS =====
+def get_db_connection():
+    """Создает соединение с PostgreSQL"""
+    return psycopg2.connect(**DB_CONFIG)
+
+
 def init_db():
     """Инициализация базы данных"""
-    conn = sqlite3.connect(DATABASE_NAME)
+    conn = get_db_connection()
     cur = conn.cursor()
     cur.execute('''
         CREATE TABLE IF NOT EXISTS promo_codes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             code TEXT UNIQUE NOT NULL,
             discount_value TEXT NOT NULL,
             is_used BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at DATETIME NOT NULL,
-            used_at DATETIME,
+            created_at TIMESTAMP NOT NULL,
+            used_at TIMESTAMP,
             issued_to TEXT NOT NULL,
-            issued_at DATETIME,
+            issued_at TIMESTAMP,
             used_by TEXT DEFAULT NULL
         )
     ''')
     conn.commit()
+    cur.close()
     conn.close()
 
 
@@ -58,10 +72,11 @@ def generate_unique_code():
         random_part = ''.join(random.choices(string.ascii_uppercase + string.digits, k=CODE_LENGTH))
         code = f"{CODE_PREFIX}{random_part}" if CODE_PREFIX else random_part
 
-        conn = sqlite3.connect(DATABASE_NAME)
+        conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute('SELECT id FROM promo_codes WHERE code = ?', (code,))
+        cur.execute('SELECT id FROM promo_codes WHERE code = %s', (code,))
         exists = cur.fetchone()
+        cur.close()
         conn.close()
 
         if not exists:
@@ -78,11 +93,11 @@ def create_promo_code_for_user(user_name):
         conn = None
 
         try:
-            conn = sqlite3.connect(DATABASE_NAME)
+            conn = get_db_connection()
             cur = conn.cursor()
 
             # Проверяем, не существует ли код (дополнительная проверка)
-            cur.execute('SELECT id FROM promo_codes WHERE code = ?', (code,))
+            cur.execute('SELECT id FROM promo_codes WHERE code = %s', (code,))
             if cur.fetchone():
                 logging.warning(f"Код {code} уже существует в БД (коллизия)")
                 attempts += 1
@@ -91,24 +106,24 @@ def create_promo_code_for_user(user_name):
             # Вставляем новый код
             cur.execute('''
                 INSERT INTO promo_codes (code, discount_value, created_at, issued_to, issued_at)
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s)
             ''', (code, DISCOUNT_TEMPLATE, datetime.now(), user_name, datetime.now()))
             conn.commit()
 
             logging.info(f"Успешно создан промо-код {code} для пользователя {user_name}")
             return code, DISCOUNT_TEMPLATE
 
-        except sqlite3.IntegrityError as e:
+        except psycopg2.IntegrityError as e:
             if conn:
                 conn.rollback()
             logging.error(f"IntegrityError: {e}")
 
             # Анализируем тип ошибки
             error_msg = str(e)
-            if "UNIQUE constraint failed: promo_codes.code" in error_msg:
+            if "unique constraint" in error_msg.lower() and "promo_codes_code" in error_msg:
                 logging.warning(f"Коллизия кода {code} - пробуем снова")
                 attempts += 1
-            elif "NOT NULL constraint failed" in error_msg:
+            elif "not null" in error_msg.lower():
                 logging.error("Ошибка NOT NULL constraint")
                 return None, None
             else:
@@ -131,46 +146,51 @@ def create_promo_code_for_user(user_name):
 
 def has_user_received_code(user_name):
     """Проверяет, получал ли пользователь код ранее"""
-    conn = sqlite3.connect(DATABASE_NAME)
+    conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('SELECT code FROM promo_codes WHERE issued_to = ?', (user_name,))
+    cur.execute('SELECT code FROM promo_codes WHERE issued_to = %s', (user_name,))
     result = cur.fetchone()
+    cur.close()
     conn.close()
     return result is not None
 
 
 def apply_promo_code(code, applied_by_user_id=None):
     """Применяет промо-код (отмечает как использованный)"""
-    conn = sqlite3.connect(DATABASE_NAME)
+    conn = get_db_connection()
     cur = conn.cursor()
 
     cur.execute('''
         SELECT id, is_used, discount_value, issued_to 
-        FROM promo_codes WHERE code = ?
+        FROM promo_codes WHERE code = %s
     ''', (code,))
     result = cur.fetchone()
 
     if not result:
+        cur.close()
         conn.close()
         return False, "Код не найден"
 
     code_id, is_used, discount_value, issued_to = result
 
     if not issued_to:
+        cur.close()
         conn.close()
         return False, "Код не был выдан пользователю"
 
     if is_used:
+        cur.close()
         conn.close()
         return False, "Код уже использован"
 
     # Помечаем код как использованный
     cur.execute('''
         UPDATE promo_codes 
-        SET is_used = TRUE, used_at = ?, used_by = ?
-        WHERE code = ?
+        SET is_used = TRUE, used_at = %s, used_by = %s
+        WHERE code = %s
     ''', (datetime.now(), applied_by_user_id, code))
     conn.commit()
+    cur.close()
     conn.close()
 
     return True, f"✅ Код '{code}' на скидку {discount_value} успешно применен!"
@@ -178,15 +198,28 @@ def apply_promo_code(code, applied_by_user_id=None):
 
 def get_code_info(code):
     """Возвращает информацию о коде"""
-    conn = sqlite3.connect(DATABASE_NAME)
-    cur = conn.cursor()
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute('''
         SELECT code, discount_value, is_used, created_at, issued_to, used_at, used_by
-        FROM promo_codes WHERE code = ?
+        FROM promo_codes WHERE code = %s
     ''', (code,))
     result = cur.fetchone()
+    cur.close()
     conn.close()
-    return result
+
+    # Конвертируем RealDictRow в tuple для совместимости
+    if result:
+        return (
+            result['code'],
+            result['discount_value'],
+            result['is_used'],
+            result['created_at'],
+            result['issued_to'],
+            result['used_at'],
+            result['used_by']
+        )
+    return None
 
 
 # ===== QR CODE GENERATION =====
@@ -217,7 +250,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("ℹ️ Помощь", callback_data="help")]
     ]
     if user_name in ADMIN_USER_NAMES:
-        keyboard.append([InlineKeyboardButton("📱 Сканировать QR-код", callback_data="scan_qr")],)
+        keyboard.append([InlineKeyboardButton("📱 Сканировать QR-код", callback_data="scan_qr")], )
         keyboard.append([InlineKeyboardButton("👑 Админ-статистика", callback_data="admin_stats")])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -316,6 +349,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Только администраторы могут применить промокод")
 
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик нажатий на кнопки"""
     query = update.callback_query
@@ -405,7 +439,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("У вас нет прав для этой команды.")
         return
 
-    conn = sqlite3.connect(DATABASE_NAME)
+    conn = get_db_connection()
     cur = conn.cursor()
 
     cur.execute('SELECT COUNT(*) FROM promo_codes')
@@ -417,6 +451,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute('SELECT COUNT(*) FROM promo_codes WHERE is_used = TRUE')
     used = cur.fetchone()[0]
 
+    cur.close()
     conn.close()
 
     stats_text = f"""
@@ -431,6 +466,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
 
     await update.effective_message.reply_text(stats_text)
+
 
 # ===== MAIN =====
 def main():
