@@ -390,7 +390,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Чтобы получить промо-код, подпишитесь на наш канал!",
                     reply_markup=reply_markup
                 )
-        except Exception as e:
+        except ZeroDivisionError as e:
             logging.error(f"Ошибка при проверке подписки: {e}")
             await query.edit_message_text("Произошла ошибка. Попробуйте позже.")
 
@@ -468,6 +468,35 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(stats_text)
 
 
+class AdminFilter(filters.MessageFilter):
+    def filter(self, message):
+        user_name = message.from_user
+        return user_name and user_name in ADMIN_USER_NAMES
+
+
+# Для обычных пользователей - информационное сообщение с меню
+async def handle_photo_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик фото от обычных пользователей"""
+    user = update.effective_user
+
+    # Создаем клавиатуру с меню
+    keyboard = [
+        [InlineKeyboardButton("🎁 Получить промо-код", callback_data="get_promo")],
+        [InlineKeyboardButton("ℹ️ Помощь", callback_data="help")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        f"👋 Привет, {user.first_name}!\n\n"
+        "📷 Я получил ваш файл, но отправка файлов и сканирование QR-кодов доступно только администраторам.\n\n"
+        "🎁 Вы можете получить свой промо-код и активировать его на кассе!\n\n"
+        "Выберите действие:",
+        reply_markup=reply_markup
+    )
+
+
+admin_filter = AdminFilter()
+
 # ===== MAIN =====
 def main():
     init_db()
@@ -477,7 +506,8 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", admin_stats))
     application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.PHOTO & admin_filter, handle_photo))
+    application.add_handler(MessageHandler(filters.PHOTO & ~admin_filter, handle_photo_user))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     application.run_polling()
